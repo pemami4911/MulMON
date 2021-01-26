@@ -6,7 +6,9 @@ import torch
 from trainer.base_trainer import BaseTrainer
 from utils import inf_loop
 import trainer._utils as utils
-
+import time
+import numpy as np
+from collections import deque
 
 class ModelTrainer(BaseTrainer):
     """ Trainer (GPUs work in parallel) """
@@ -44,7 +46,7 @@ class ModelTrainer(BaseTrainer):
         self.generated_dir = config.generated_dir
 
     def train(self):
-        print('\n================== Start training ===================')
+        print(f'\n================== Start training (validation period {self.config.val_period}) ===================')
         # self.start_time = time.time()
         assert (self.epochs + 1) > self.start_epoch
         for epoch in range(self.start_epoch, self.epochs + 1):
@@ -71,6 +73,8 @@ class ModelTrainer(BaseTrainer):
         metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
         header = 'Epoch: [{}]'.format(epoch)
         iter_count = (epoch - 1) * self.step_per_epoch
+        #forward_queue = deque(maxlen=100)
+        #backward_queue = deque(maxlen=100)
 
         for bid, (images, targets) in enumerate(metric_logger.log_every(self.train_loader, self.config.log_period, len_iter=self.step_per_epoch, header=header)):
             images = list(image.to(self.device).detach() for image in images)
@@ -83,11 +87,15 @@ class ModelTrainer(BaseTrainer):
                 std_global = self.config.pixel_sigma
 
             self.optimizer.zero_grad()
+            #start = time.time()
             loss_dict = self.model(images, targets, std=std_global)
+            #forward_queue.append(time.time() - start)
             losses = sum(loss for loss in loss_dict.values())
 
             # --- back prop gradients ---
+            #start = time.time()
             losses.backward()
+            #backward_queue.append(time.time() - start)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
             self.optimizer.step()
 
@@ -116,6 +124,9 @@ class ModelTrainer(BaseTrainer):
             metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
             metric_logger.update(lr=self.optimizer.param_groups[0]["lr"])
 
+            #print('Forward average time (ms): {}, backward average time (ms): {}'.format(
+            #    np.mean(forward_queue) * 1000., np.mean(backward_queue) * 1000.
+            #))
             if bid == self.step_per_epoch:
                 break
 
@@ -125,7 +136,7 @@ class ModelTrainer(BaseTrainer):
         :return: a dict of model's output
         """
         self.model.eval()
-        if epoch % self.config.show_period == 0 and self.device_id == self.config.gpu_start:
+        if epoch % self.config.val_period == 0 and self.device_id == self.config.gpu_start:
             vis_epo_dir = os.path.join(self.vis_train_dir, 'epoch_{}_gpu{}'.format(epoch, self.device_id))
             if not os.path.exists(vis_epo_dir):
                 os.mkdir(vis_epo_dir)

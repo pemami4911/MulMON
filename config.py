@@ -63,7 +63,7 @@ class CONFIG(object):
 
     # trainging recording
     log_period = 1    # print training status on terminal (unit: step)
-    val_period = 10   # validate every <#> epochs
+    val_period = 5   # validate every <#> epochs
     show_period = 10  # visualise trainign outputs every <#> epochs
     save_period = 10  # save training weights every <#> epochs
 

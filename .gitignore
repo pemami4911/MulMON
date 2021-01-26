@@ -110,3 +110,5 @@ venv.bak/
 .idea/
 .DS_Store
 eval.py
+
+*.tar.gz

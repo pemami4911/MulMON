@@ -3,7 +3,7 @@ import torch
 from abc import abstractmethod
 from torch.utils.tensorboard.writer import SummaryWriter
 # from tensorboardX import SummaryWriter   # use this if pytorch <= 1.2
-
+import os
 
 def func(m):
     m = torch.nn.DataParallel(m, device_ids=[0, 1])
@@ -38,9 +38,12 @@ class BaseTrainer:
         self.vis_train_dir = config.vis_train_dir
         self.generated_dir = config.generated_dir
 
-        # setup visualization writer instance
-        self.writer = SummaryWriter(self.save_dir, max_queue=10)
-
+        if self.device_id == 0:
+            # setup visualization writer instance
+            self.writer = SummaryWriter(os.path.join(self.save_dir, config.run_name), max_queue=10)
+        else:
+            self.writer = None
+            
     @abstractmethod
     def _train_epoch(self, epoch):
         """

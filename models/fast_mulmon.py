@@ -5,8 +5,9 @@ from attrdict import AttrDict
 import torch
 import torch.nn as nn
 import torch.distributions as dist
-from models.encoder import Encoder
 from models.decoder import SpatialBroadcastDec
+from models.encoder import ObjectDiscoveryBlock
+from models.custom import mvn, std_mvn
 import visualisation as vis
 import utils
 
@@ -16,39 +17,69 @@ def to_sigma(logvar):
     return torch.exp(0.5*logvar)
 
 
-class RefineNetLSTM(nn.Module):
-    """
-    function Phi (see Sec 3.3 of the paper)
-    (adapted from: https://github.com/MichaelKevinKelly/IODINE)
-    """
-    def __init__(self, z_dim, channels_in, image_size):
-        super(RefineNetLSTM, self).__init__()
-        self.convnet = Encoder(channels_in, 128, image_size)
-        self.lstm = nn.LSTMCell(128 + 4 * z_dim, 128, bias=True)
-        self.fc_out = nn.Linear(128, 2 * z_dim)
+class RefinementNetwork(nn.Module):
+    def __init__(self, z_dim):
+        super(RefinementNetwork, self).__init__()
+        
+        self.recurrence = nn.GRU(z_dim, z_dim)
+        self.encoding  = nn.Sequential(
+            nn.Linear(4 * z_dim, 128),
+            nn.ELU(True),
+            nn.Linear(128, z_dim)
+        )
+        self.loc = nn.Linear(z_dim, z_dim)
+        self.softplus = nn.Linear(z_dim, z_dim)
 
-    def forward(self, x, h, c):
-        x_img, lmbda_moment = x['img'], x['state']
-        conv_codes = self.convnet(x_img)
-        lstm_input = torch.cat((lmbda_moment, conv_codes), dim=1)
-        h, c = self.lstm(lstm_input, (h, c))
-        return self.fc_out(h), h, c
+        self.loc_LN = nn.LayerNorm((z_dim,), elementwise_affine=False)
+        self.softplus_LN = nn.LayerNorm((z_dim,), elementwise_affine=False)
+        
+
+    def forward(self, loss, lamda, hidden_state, eval_mode):
+        """
+        Args: 
+            loss: [N] scalar outputs provided to torch.autograd.grad  
+            lamda: [N*K, 2 * z_dim] current posterior parameters
+        Returns:
+            lamda_next: [N*K, 2 * z_dim], the updated posterior parameters
+            hidden_state: next recurrent hidden state
+        """
+        d_lamda = torch.autograd.grad(loss, lamda, create_graph=not eval_mode, \
+            retain_graph=not eval_mode, only_inputs=True)
+
+        d_loc, d_sp = d_lamda[0].chunk(2, 1)
+        d_loc, d_sp = d_loc.contiguous(), d_sp.contiguous()
+
+        d_loc = self.loc_LN(d_loc).detach()
+        d_sp = self.softplus_LN(d_sp).detach()
+
+        x = self.encoding( torch.cat([lamda, d_loc, d_sp], 1))
+        x = x.unsqueeze(0)
+        self.recurrence.flatten_parameters()
+        x, hidden_state = self.recurrence(x, hidden_state)
+        x = x.squeeze(0)
+        return torch.cat([self.loc(x), self.softplus(x)], 1), hidden_state
 
 
-class MulMON(nn.Module):
+
+class FastMulMON(nn.Module):
     """
     v1: object-centric GQN.
        a. learning scenes from T available multi-view observations.
        b. querying scene synthesis and segmentation
+
+    1. Change x inputs to [-1,1]
+    2. Change class inputs from using @Net.config
+    3. Check for class member availability
+    4. Training algo; after 100K steps out of 300K, change from 3 to 1 refinement iter in inner loop
     """
     def __init__(self,
                  config,
-                 name='MulMON'):
-        super(MulMON, self).__init__()
+                 name='FastMulMON'):
+        super(FastMulMON, self).__init__()
         self.name = name
         self.config = config
         self.training = True if self.config.WORK_MODE == 'training' else False
-        self.nit_innerloop = 5  # num_iterations of the inner loop
+        self.nit_innerloop = self.config.refinement_iters  # num_iterations of the inner loop
         self.K = self.config.num_slots
         self.v_in_dim = self.config.v_in_dim
         self.z_dim = self.config.latent_dim
@@ -58,8 +89,36 @@ class MulMON(nn.Module):
         self.min_num_views = self.config.min_sample_views
         self.max_num_views = self.config.max_sample_views
         self.num_vq_show = self.config.num_vq_show
+        # Patrick
+        self.stochastic_layers = self.config.stochastic_layers
+
         self.decoder = SpatialBroadcastDec(self.z_dim, 4, self.config.image_size)
-        self.refine_net = RefineNetLSTM(self.z_dim, channels_in=17, image_size=self.config.image_size)
+        
+        # Patrick
+        self.pos_embed_projection = nn.Linear(4, 64)
+        self.encoder_pt_1 = nn.Sequential(
+            nn.Conv2d(3, 64, 5, 1, 2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 5, 1, 2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 5, 1, 2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 5, 1, 2),
+            nn.ReLU(True)
+        )
+        self.encoder_pt_2 = nn.Sequential(
+            nn.LayerNorm(64),
+            nn.Linear(64,64),
+            nn.ReLU(True),
+            nn.Linear(64,64)
+        )
+        self.object_discovery_block = ObjectDiscoveryBlock(self.K, self.z_dim, 
+            self.config.image_size, self.stochastic_layers)
+        
+        if self.nit_innerloop > 0:
+            self.refinenet = RefinementNetwork(self.z_dim)
+            self.h_0 = torch.zeros(1, self.K, self.z_dim)
+        
         self.view_encoder = nn.Sequential(
             nn.Linear(self.v_in_dim, 128, bias=True),
             nn.ReLU(inplace=True),
@@ -71,6 +130,18 @@ class MulMON(nn.Module):
             nn.Linear(512, self.z_dim, bias=True)
         )
         self.lmbda0 = nn.Parameter(torch.randn(1, 2*self.z_dim) - 0.5, requires_grad=True)
+        # Patrick
+        #self.positional_embedding = FastMulMON.create_positional_embedding(H, W, B*V).to(xmul.device)
+        self.positional_embedding = FastMulMON.create_positional_embedding(64, 64, 4*10)
+        
+    @staticmethod
+    def create_positional_embedding(h, w, batch_size):
+        dist_right = torch.linspace(1, 0, w).view(w,1,1).repeat(1,h,1)  # [w,h,1]
+        dist_left = torch.linspace(0, 1, w).view(w,1,1).repeat(1,h,1)
+        dist_top = torch.linspace(0, 1, h).view(1,h,1).repeat(w,1,1)
+        dist_bottom = torch.linspace(1, 0, h).view(1,h,1).repeat(w,1,1)
+        return torch.cat([dist_right, dist_left, dist_top, dist_bottom],2).unsqueeze(0).repeat(batch_size,1,1,1)
+
 
     @staticmethod
     def save_visuals(vis_images, vis_recons, vis_comps, vis_hiers, save_dir, start_id=0):
@@ -212,60 +283,6 @@ class MulMON(nn.Module):
         x = (x - layer_mean) / (layer_std + 1e-5)
         return x
 
-    def get_refine_inputs(self, _x, mu_x, masks, mask_logits, ll_pxl, lmbda, loss, ll_col):
-        """
-        Generate inputs to refinement network
-        (adapted from: https://github.com/MichaelKevinKelly/IODINE)
-        """
-        N, K, C, H, W = mu_x.shape
-
-        # Calculate additional non-gradient inputs
-        # ll_pxl is the mixture log-likelihood [N, 1, 3, H, W]
-        # ll_col is the color gaussian ll, not account for masks [N, K, 3, H, W]
-        x_lik = ll_pxl.sum(dim=2, keepdim=True).exp().repeat(1, K, 1, 1, 1)  # [N, K, 1, H, W]
-        col_lik = torch.softmax(ll_col.sum(2, keepdim=True), dim=1)  # (N,K,1,H,W)
-
-        # This computation is a little weird. Basically we do not count one of the slot.
-        K_likelihood = ll_col.sum(dim=2, keepdim=True).exp()  # (B, K, 1, H, W)
-        # likelihood = (B, 1, 1, H, W), self.mask (B, K, 1, H, W)
-        likelihood = (masks * K_likelihood).sum(dim=1, keepdim=True)  # (B, 1, 1, H, W)
-        # leave_one_out (B, K, 1, H, W)
-        leave_one_out = likelihood - masks * K_likelihood
-        # normalize
-        leave_one_out = leave_one_out / (1 - masks + 1e-5)
-
-        # Calculate gradient inputs
-        dmu_x = torch.autograd.grad(loss, mu_x, retain_graph=True, only_inputs=True)[0]  ## (N,K,C,H,W)
-        dmasks = torch.autograd.grad(loss, masks, retain_graph=True, only_inputs=True)[0]  ## (N,K,1,H,W)
-        dlmbda = torch.autograd.grad(loss, lmbda, retain_graph=True, only_inputs=True)[0]  ## (N*K,2*z_dim)
-
-        # Layer norm -- stablises trainings
-        x_lik_stable = self.layernorm(x_lik).detach()
-        leave_one_out_stable = self.layernorm(leave_one_out).detach()
-        dmu_x_stable = self.layernorm(dmu_x).detach()
-        dmasks_stable = self.layernorm(dmasks).detach()
-        dlmbda_stable = self.layernorm(torch.stack(dlmbda.chunk(N, 0), 0)).detach()
-        dlmbda_stable = torch.cat(dlmbda_stable.split(1, dim=0), dim=1).squeeze(0)
-
-        # Generate coordinate channels
-        xx = torch.linspace(-1, 1, W, device=_x.device)
-        yy = torch.linspace(-1, 1, H, device=_x.device)
-        yy, xx = torch.meshgrid((yy, xx))
-        # (2, H, W)
-        coords = torch.stack((xx, yy), dim=0)
-        coords = coords[None, None].repeat(N, self.K, 1, 1, 1).detach()
-
-        # Concatenate into vec and mat inputs
-        img_args = (_x, mu_x, masks, mask_logits, dmu_x_stable, dmasks_stable,
-                    col_lik, x_lik_stable, leave_one_out_stable, coords)
-        state_args = (lmbda, dlmbda_stable)
-        img_inp = torch.cat(img_args, dim=2)
-        state_inp = torch.cat(state_args, dim=1)
-
-        # Reshape
-        img_inp = img_inp.view((N * K,) + img_inp.shape[2:])
-
-        return {'img': img_inp, 'state': state_inp}
 
     def decode(self, z):
         K = self.K
@@ -277,61 +294,157 @@ class MulMON(nn.Module):
         mu_x = mu_x.reshape((B, K,) + mu_x.shape[1:])
         return mask_logits, mu_x
 
-    def _iterative_inference(self, x, y, lmbda, niter=1):
+
+    def _iterative_inference(self, x_orig, inputs, y, lmbda, niter=1):
         """
+        *** x is in [-1,1] range for transformer, but for NLL we need to map back to [0,1] range ***
         :param x: [B, 3, H, W]
+        :param y: [B, K, 8]
         :param lmbda:  [B*K, 2*D]
         """
-        B, C, _, _ = x.size()
-        K = self.K
         total_loss = 0.
+        batch_size, C, H, W = x_orig.shape
 
-        # Initialize LSTMCell hidden states
-        h = torch.zeros(B * K, 128, device=x.device, requires_grad=True)
-        c = torch.zeros_like(h, device=x.device, requires_grad=True)
-        assert h.max().item() == 0. and h.min().item() == 0.
-        mu_pri, logvar_pri = lmbda.chunk(2, dim=1)
+        all_samples = {}
+        x_orig = (x_orig + 1) / 2.
+        # Encode posterior with L stochastic layers
+        slots, posteriors, posterior_samples, posterior_lambda = self.object_discovery_block(inputs, lmbda)
+        all_samples = {**all_samples, **posterior_samples}
 
+        #Obtain view-conditioned scene representations
+        z_y = self.projector(torch.cat((slots, y.reshape(batch_size*self.K, -1)), dim=-1))
+
+        # [N*K, M, C, H, W], [N*K, M, 1, H, W]
+        mask_logits, x_loc = self.decode(z_y)
+        slots = slots.view(-1, self.K, self.z_dim)
+        mask_logits = mask_logits.view(-1, self.K, 1, H, W)
+        x_loc = x_loc.view(-1, self.K, C, H, W)
+        # get the mixing coefficients (Categorical parameters)
+        masks = torch.softmax(mask_logits, dim=1)  # (N,K,1,H,W)
+        
+        # Compute NLL and KL from encoder
+        # top-down kl
+        kl_div = torch.zeros(batch_size).to(x_orig.device)
+
+        # TODO: make self.stochastic_layers+1
+        for layer in list(range(self.stochastic_layers))[::-1]:
+            if layer == self.stochastic_layers-1:
+                prior_z = std_mvn(shape=[batch_size * self.K, self.z_dim], device=x_orig.device)
+            else:
+                loc_z, sp_z = self.object_discovery_block.indep_prior(all_samples[f'posterior_z_{layer+1}'])
+                loc_z = loc_z.view(batch_size * self.K, -1)
+                sp_z = sp_z.view(batch_size * self.K, -1)
+                prior_z = mvn(loc_z, sp_z)
+ 
+            # recall that indexiing is weird: KL(  q(z^1 | x) || p(z^L) )
+            kl = torch.distributions.kl.kl_divergence(posteriors[layer], prior_z)
+            kl= kl.view(batch_size, self.K).sum(1)
+            kl_div += kl
+
+        _x = x_orig.unsqueeze(dim=1).repeat(1, self.K, 1, 1, 1)
+        ll_pxl, ll_col = self.Gaussian_ll(x_loc, _x, masks, self.std)  # (N,1,3,H,W)
+        nll = -1. * (ll_pxl.flatten(start_dim=1).sum(dim=-1).mean()) * self.config.elbo_weights['exp_nll']
+        loss = nll + kl_div.mean() * self.config.elbo_weights['kl_latent']
+
+        total_loss += loss
         balancing_discount = 1.0 / (0.5 * (niter + 1.0))
-        for it in range(niter):
-            # Sample latent code
-            mu_z, logvar_z = lmbda.chunk(2, dim=1)
-            z = dist.Normal(mu_z, to_sigma(logvar_z)).rsample()  # (N*K,z_dim)
-            kl_qz = self.kl_exponential(mu_z, to_sigma(logvar_z),
-                                        pri_mu=mu_pri, pri_sigma=to_sigma(logvar_pri), z_samples=z)
-            kl_qz = torch.stack(kl_qz.chunk(B, dim=0), dim=0).sum(dim=(1, 2))
+        if self.nit_innerloop > 0:
+            h = self.h_0.repeat(1, batch_size, 1).to(x_orig.device)
+        for refinement_iter in range(self.nit_innerloop):
+            # update posterior_lamda
+            delta_posterior_lambda, h = self.refinenet(loss, posterior_lambda, h, not self.training)
+            posterior_lambda = posterior_lambda + delta_posterior_lambda
+            #deltas += [torch.mean(torch.norm(delta_posterior_lambda, dim=1)).detach()]
+            #if refinement_iter == self.nit_innerloop-1:
+            #    deltas = torch.stack(deltas)
 
-            # Obtain view-conditioned scene representations
-            z_y = self.projector(torch.cat((z, y.reshape(B*K, -1)), dim=-1))
+            # decode
+            loc, sp = posterior_lambda.chunk(2,1)
+            posterior = mvn(loc, sp)
+            slots = posterior.rsample()
 
-            # Generate independent components (object 2d geometries + RGB values)
-            mask_logits, mu_x = self.decode(z_y)
+            slots = slots.view(-1, self.z_dim)
+            #Obtain view-conditioned scene representations
+            z_y = self.projector(torch.cat((slots, y.reshape(batch_size*self.K, -1)), dim=-1))
 
+            # [N*K, M, C, H, W], [N*K, M, 1, H, W]
+            mask_logits, x_loc = self.decode(z_y)
+            slots = slots.view(-1, self.K, self.z_dim)
+            mask_logits = mask_logits.view(-1, self.K, 1, H, W)
+            x_loc = x_loc.view(-1, self.K, C, H, W)
             # get the mixing coefficients (Categorical parameters)
-            masks = torch.softmax(mask_logits, dim=1)  # (N,K,1,H,W)
+            masks = torch.softmax(mask_logits, dim=1)  # (N,K,1,H,W)            
 
-            # Compute the loss (neg ELBO): reconstruction (nll) & KL divergence
-            _x = x.unsqueeze(dim=1).repeat(1, K, 1, 1, 1)
-            ll_pxl, ll_col = self.Gaussian_ll(mu_x, _x, masks, self.std)  # (N,1,3,H,W)
+            _x = x_orig.unsqueeze(dim=1).repeat(1, self.K, 1, 1, 1)
+            ll_pxl, ll_col = self.Gaussian_ll(x_loc, _x, masks, self.std)  # (N,1,3,H,W)
             nll = -1. * (ll_pxl.flatten(start_dim=1).sum(dim=-1).mean()) * self.config.elbo_weights['exp_nll']
-            loss = nll + kl_qz.mean() * self.config.elbo_weights['kl_latent']
+            
+            kl = torch.distributions.kl.kl_divergence(posterior, prior_z)
+            kl = kl.view(batch_size, self.K).sum(1)
+            kl_div = kl
 
+            loss = nll + kl_div.mean() * self.config.elbo_weights['kl_latent']
             # Accumulate loss
-            total_loss = total_loss + loss * ((float(it) + 1) / float(niter))
+            total_loss += loss * ((float(self.nit_innerloop)+1 - (refinement_iter+1)) / float(self.nit_innerloop+1))
 
-            assert not torch.isnan(loss).any().item(), 'Loss at t={} is nan. (nll,div): ({},{})'.format(nll, kl_qz)
-            if it == niter - 1:
-                continue
+        return balancing_discount*total_loss, posterior_lambda, mask_logits, x_loc
 
-            # Refine lambda
-            refine_inp = self.get_refine_inputs(_x, mu_x, masks, mask_logits, ll_pxl, lmbda, loss, ll_col)
-            delta, h, c = self.refine_net(refine_inp, h, c)
-            assert not torch.isnan(lmbda).any().item(), 'Lmbda at t={} has nan: {}'.format(it, lmbda)
-            assert not torch.isnan(delta).any().item(), 'Delta at t={} has nan: {}'.format(it, delta)
-            lmbda = lmbda + delta
-            assert not torch.isnan(lmbda).any().item(), 'Lmbda at t={} has nan: {}'.format(it, lmbda)
 
-        return balancing_discount*total_loss, lmbda, mask_logits, mu_x
+    # def _iterative_inference(self, x, y, lmbda, niter=1):
+    #     """
+    #     :param x: [B, 3, H, W]
+    #     :param lmbda:  [B*K, 2*D]
+    #     """
+    #     B, C, _, _ = x.size()
+    #     K = self.K
+    #     total_loss = 0.
+
+    #     # Initialize LSTMCell hidden states
+    #     h = torch.zeros(B * K, 128, device=x.device, requires_grad=True)
+    #     c = torch.zeros_like(h, device=x.device, requires_grad=True)
+    #     assert h.max().item() == 0. and h.min().item() == 0.
+    #     mu_pri, logvar_pri = lmbda.chunk(2, dim=1)
+
+    #     balancing_discount = 1.0 / (0.5 * (niter + 1.0))
+    #     for it in range(niter):
+    #         # Sample latent code
+    #         mu_z, logvar_z = lmbda.chunk(2, dim=1)
+    #         z = dist.Normal(mu_z, to_sigma(logvar_z)).rsample()  # (N*K,z_dim)
+    #         kl_qz = self.kl_exponential(mu_z, to_sigma(logvar_z),
+    #                                     pri_mu=mu_pri, pri_sigma=to_sigma(logvar_pri), z_samples=z)
+    #         kl_qz = torch.stack(kl_qz.chunk(B, dim=0), dim=0).sum(dim=(1, 2))
+
+    #         # Obtain view-conditioned scene representations
+    #         z_y = self.projector(torch.cat((z, y.reshape(B*K, -1)), dim=-1))
+
+    #         # Generate independent components (object 2d geometries + RGB values)
+    #         mask_logits, mu_x = self.decode(z_y)
+
+    #         # get the mixing coefficients (Categorical parameters)
+    #         masks = torch.softmax(mask_logits, dim=1)  # (N,K,1,H,W)
+
+    #         # Compute the loss (neg ELBO): reconstruction (nll) & KL divergence
+    #         _x = x.unsqueeze(dim=1).repeat(1, K, 1, 1, 1)
+    #         ll_pxl, ll_col = self.Gaussian_ll(mu_x, _x, masks, self.std)  # (N,1,3,H,W)
+    #         nll = -1. * (ll_pxl.flatten(start_dim=1).sum(dim=-1).mean()) * self.config.elbo_weights['exp_nll']
+    #         loss = nll + kl_qz.mean() * self.config.elbo_weights['kl_latent']
+
+    #         # Accumulate loss
+    #         total_loss = total_loss + loss * ((float(it) + 1) / float(niter))
+
+    #         assert not torch.isnan(loss).any().item(), 'Loss at t={} is nan. (nll,div): ({},{})'.format(nll, kl_qz)
+    #         if it == niter - 1:
+    #             continue
+
+    #         # Refine lambda
+    #         refine_inp = self.get_refine_inputs(_x, mu_x, masks, mask_logits, ll_pxl, lmbda, loss, ll_col)
+    #         delta, h, c = self.refine_net(refine_inp, h, c)
+    #         assert not torch.isnan(lmbda).any().item(), 'Lmbda at t={} has nan: {}'.format(it, lmbda)
+    #         assert not torch.isnan(delta).any().item(), 'Delta at t={} has nan: {}'.format(it, delta)
+    #         lmbda = lmbda + delta
+    #         assert not torch.isnan(lmbda).any().item(), 'Lmbda at t={} has nan: {}'.format(it, lmbda)
+
+    #     return balancing_discount*total_loss, lmbda, mask_logits, mu_x
 
     def sample_qz_uncertainty(self, lmbda, yq):
         """image-space pixel-wise uncertainty estimation via MC sampling"""
@@ -356,7 +469,7 @@ class MulMON(nn.Module):
         # adding noise to viewpoint vectors helps to robustify the model:
         v_pts += 0.015*torch.randn_like(v_pts, dtype=xmul.dtype, device=xmul.device, requires_grad=False)
 
-        B, V, _, _, _ = xmul.size()
+        B, V, C, H, W = xmul.size()
         K, nit_inner_loop, z_dim = self.K, self.nit_innerloop, self.z_dim
 
         if std:
@@ -379,23 +492,41 @@ class MulMON(nn.Module):
         # --- scene learning phase --- #
         discount_obs = 1.0 / (0.5 * (len(obs_view_idx) + 1.0))
         # Outer loop: learning scenes from multiple views
-        inference_steps = []
+
+
+        # 1. Image embedding
+        #start = time.time()
+        xmul_orig = xmul.clone()
+        xmul = xmul.view(B*V,C,H,W)
+        xmul = self.encoder_pt_1(xmul)
+        xmul = xmul.permute(0,2,3,1).contiguous()  # [N,H,W,64]
+        positional_embedding = self.positional_embedding.to(xmul.device)
+        positional_embedding = self.pos_embed_projection(positional_embedding)
+        xmul += positional_embedding  # [N,H,W,64]
+        xmul = xmul.view(positional_embedding.shape[0], -1, 64)  # [N,64,H*W]
+        xmul = self.encoder_pt_2(xmul)  # [N,H*W,64]
+        xmul = xmul.view(B, V, H*W, 64)
+        #print('Video embedding: {} s'.format(time.time() - start))
+        #inference_steps = []
         for venum, v in enumerate(obs_view_idx):
-            x = xmul[:, v, ...]
+            #x = xmul[:, v, ...]
+            inps = xmul[:, v,...]
+            x_orig = xmul_orig[:, v, ...]
             y = v_feat[:, :, v, :]
 
-            # Patrick: Here is where we replace IODINE with MMORL
-
+            # Patrick: Here is where we replace IODINE with MMORL            
             # Inner loop: single-view scene learning in an iterative fashion
-            start = time.time()
-            nelbo_v, lmbda, _, _ = self._iterative_inference(x, y, lmbda, nit_inner_loop)
-            inference_steps += [time.time() - start]
+            #start = time.time()
+            nelbo_v, lmbda, _, _ = self._iterative_inference(x_orig, inps, y, lmbda, nit_inner_loop)
+            #inference_steps += [time.time() - start]
             neg_elbo = neg_elbo + nelbo_v.mean() * ((float(venum) + 1) / float(len(obs_view_idx)))
         #print('mean/total inference time: {} s/{} s'.format(np.mean(inference_steps), np.sum(inference_steps)))
 
         # --- scene querying phase --- #
         for vqnum, vq in enumerate(qry_view_idx):
-            x = xmul[:, vq, ...]
+            #x = xmul[:, vq, ...]
+            x_orig = xmul_orig[:, vq, ...]
+            x_orig = (x_orig + 1) / 2.
             yq = v_feat[:, :, vq, :]
 
             # Sample 3D-informative object latents
@@ -408,7 +539,7 @@ class MulMON(nn.Module):
             mask_logits, mu_x = self.decode(z_yq)
             # get masks
             masks = torch.softmax(mask_logits, dim=1)
-            ll_pxl, _ = self.Gaussian_ll(mu_x, x.unsqueeze(dim=1).expand((B, K,) + x.shape[1:]),
+            ll_pxl, _ = self.Gaussian_ll(mu_x, x_orig.unsqueeze(dim=1).expand((B, K,) + x_orig.shape[1:]),
                                          masks, self.std)  # (N,1,3,H,W)
             nll = -1. * (ll_pxl.flatten(start_dim=1).sum(dim=-1).mean())
 
@@ -431,7 +562,7 @@ class MulMON(nn.Module):
         xmul = torch.stack(images, dim=0)  # [B, V, C, H, W]
         v_pts = torch.stack([tar['view_points'] for tar in targets], dim=0).type(xmul.dtype)  # [B, V, 3]
 
-        B, V, _, _, _ = xmul.size()
+        B, V, C, H, W = xmul.size()
         K, nit_inner_loop, z_dim = self.K, self.nit_innerloop, self.z_dim
 
         # sample the number of observations and which observations
@@ -454,19 +585,33 @@ class MulMON(nn.Module):
         vis_2d_latents = []
         vis_3d_latents = []
 
+        xmul_orig = xmul.clone()
+        xmul = xmul.view(B*V,C,H,W)
+        xmul = self.encoder_pt_1(xmul)
+        xmul = xmul.permute(0,2,3,1).contiguous()  # [N,H,W,64]
+        positional_embedding = self.positional_embedding.to(xmul.device)
+        positional_embedding = self.pos_embed_projection(positional_embedding)
+        xmul += positional_embedding  # [N,H,W,64]
+        xmul = xmul.view(positional_embedding.shape[0], -1, 64)  # [N,64,H*W]
+        xmul = self.encoder_pt_2(xmul)  # [N,H*W,64]
+        xmul = xmul.view(B, V, H*W, 64)
+
         # --- scene learning phase --- #
         for venum, v in enumerate(obs_view_idx):
-            x = xmul[:, v, ...]
+            inps = xmul[:, v,...]
+            x_orig = xmul_orig[:, v, ...]
             y = v_feat[:, :, v, :]
 
-            # Knowledge summarize in an iterative fashion (does not have to be though: set T=1)
-            nelbo_v, lmbda, m_logits, mu_x = self._iterative_inference(x, y, lmbda, nit_inner_loop)
+            # Patrick: Here is where we replace IODINE with MMORL            
+            # Inner loop: single-view scene learning in an iterative fashion
+            #start = time.time()
+            nelbo_v, lmbda, m_logits, mu_x = self._iterative_inference(x_orig, inps, y, lmbda, nit_inner_loop)
             masks = torch.softmax(m_logits, dim=1)
 
             # get independent object silhouette
             indi_masks = torch.sigmoid(m_logits)
-
-            vis_images.append(utils.numpify(x))
+            x_orig = (x_orig + 1) / 2.
+            vis_images.append(utils.numpify(x_orig))
             vis_recons.append(utils.numpify(torch.sum(masks*mu_x, dim=1)))
             vis_comps.append(utils.numpify(indi_masks*mu_x))
             vis_hiers.append(utils.numpify(masks))
@@ -476,7 +621,8 @@ class MulMON(nn.Module):
         # --- scene querying phase --- #
         assert len(qry_view_idx) > 0
         for vqnum, vq in enumerate(qry_view_idx):
-            x = xmul[:, vq, ...]
+            x_orig = xmul_orig[:, vq, ...]
+            x_orig = (x_orig + 1) / 2.
             yq = v_feat[:, :, vq, :]
 
             # making view-dependent generation
@@ -494,7 +640,7 @@ class MulMON(nn.Module):
             # uncomment the below to binarize the silhouette with a tunable threshold (default: 0.5).
             # indi_masks = (indi_masks > 0.5).type(mu_x.dtype)
 
-            vis_images.append(utils.numpify(x))
+            vis_images.append(utils.numpify(x_orig))
             vis_recons.append(utils.numpify(torch.sum(masks * mu_x, dim=1)))
             vis_comps.append(utils.numpify(indi_masks * mu_x))
             vis_hiers.append(utils.numpify(masks))
@@ -512,6 +658,7 @@ class MulMON(nn.Module):
 
         if save_sample_to is not None:
             if vis_train:
+                print('Saving val viz...')
                 self.save_visuals(vis_images, vis_recons, vis_comps, vis_hiers,
                                   save_dir=save_sample_to,
                                   start_id=save_start_id)

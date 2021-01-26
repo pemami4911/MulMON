@@ -139,9 +139,12 @@ def train(process_id, CFG):
     elif 'IODINE' in CFG.arch:
         from models.baseline_iodine import IODINE as ScnModel
         print(" --- Arch: IODINE ---")
-    elif 'MulMON' in CFG.arch:
+    elif 'MulMON' == CFG.arch:
         from models.mulmon import MulMON as ScnModel
         print(" --- Arch: MulMON ---")
+    elif 'FastMulMON' == CFG.arch:
+        from models.fast_mulmon import FastMulMON as ScnModel
+        print(" --- Arch: FastMulMON ---")
     else:
         raise NotImplementedError
 
@@ -246,6 +249,7 @@ def main(cfg):
     parser = argparse.ArgumentParser()
     parser.add_argument('--arch', type=str, default='ScnModel',
                         help="model name")
+    parser.add_argument('--run_name', type=str, default='')
     parser.add_argument('--datatype', type=str, default='clevr',
                         help="one of [gqn_jaco, clevr_mv, clevr_aug]")
     parser.add_argument('--epochs', default=1000, type=int, metavar='N', help='number of total epochs to run')
@@ -264,7 +268,9 @@ def main(cfg):
 
     parser.add_argument('--seed', default=0, type=int, help='random seed')
     parser.add_argument('--lr_rate', default=1e-4, type=float, help='learning rate')
-
+    # Patrick
+    parser.add_argument('--refinement_iters', default=3, type=int, help='# iters of inner inference loop')
+    parser.add_argument('--stochastic_layers', default=3, type=int, help='# of stoch layers in HVAE')
     parser.add_argument('--num_slots', default=7, type=int, help='(maximum) number of component slots')
     parser.add_argument('--temperature', default=0.0, type=float,
                         help='spatial scheduler increase rate, the hotter the faster coeff grows')
@@ -293,6 +299,10 @@ def main(cfg):
     # General training reconfig
     ###########################################
     cfg.arch = args.arch
+    # Patrick
+    cfg.run_name = args.run_name
+    if cfg.run_name == '':
+        cfg.run_name = cfg.arch
     cfg.DATA_TYPE = args.datatype
     cfg.num_epochs = args.epochs
     cfg.step_per_epoch = args.step_per_epoch if args.step_per_epoch > 0 else None
@@ -312,6 +322,9 @@ def main(cfg):
     cfg.pixel_sigma = args.pixel_sigma
     cfg.use_mask = args.use_mask
     cfg.use_bg = args.use_bg
+    # Patrick
+    cfg.stochastic_layers = args.stochastic_layers
+    cfg.refinement_iters = args.refinement_iters
     cfg.elbo_weights = {
         'kl_latent': args.kl_latent,
         'kl_spatial': args.kl_spatial,

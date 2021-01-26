@@ -33,6 +33,8 @@ class ClevrMVDataset(Dataset):
         item = self.data_base[idx]
         mydata = np.load(os.path.join(self.addr_root, item['data_path']))
         image = mydata['images'][..., :3].astype('float32')/255
+        # to [-1,1]
+        image = image * 2 - 1
         mask_pack_raw = mydata['masks']
         masks_obs, masks_clr, num_comps = self.extract_masks(item, mask_pack_raw, self.background)  # [V, H, W, K]
         view_pts = self.normalise_viewpoints(item)
